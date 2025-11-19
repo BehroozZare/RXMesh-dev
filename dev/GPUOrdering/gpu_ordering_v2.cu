@@ -12,6 +12,7 @@
 #include "min_vertex_cover_bipartite.h"
 #include "rxmesh/rxmesh_static.h"
 #include "spdlog/spdlog.h"
+#include <cuda_profiler_api.h>
 
 namespace RXMESH_SOLVER {
 
@@ -248,10 +249,19 @@ void GPUOrdering_V2::two_way_Q_partition(
     }
 }
 
-void GPUOrdering_V2::find_separator_superset(
+
+void GPUOrdering_V2::find_separator_superset_GPU(
     std::vector<int>& assigned_g_nodes,///<[in] Assigned G nodes for current decomposition
     std::vector<int>& separator_superset///<[out] The superset of separator nodes
 ){
+
+}
+
+void GPUOrdering_V2::find_separator_superset_CPU(
+    std::vector<int>& assigned_g_nodes,///<[in] Assigned G nodes for current decomposition
+    std::vector<int>& separator_superset///<[out] The superset of separator nodes
+)
+{
 
     auto get_partition_id = [&](int g_node_id) -> int {
         int q_node_id = this->_g_node_to_patch[g_node_id];
@@ -259,24 +269,27 @@ void GPUOrdering_V2::find_separator_superset(
     };
 
     separator_superset.clear();
-    separator_superset.reserve(100);
-    for(int i = 0; i < assigned_g_nodes.size(); i++) {
-        int g_node = assigned_g_nodes[i];
+    for(int g_node : assigned_g_nodes) {
+        assert(g_node < this->_G_n);
         int partition_id = get_partition_id(g_node);
         for (int nbr_ptr = this->_Gp[g_node]; nbr_ptr < this->_Gp[g_node + 1]; ++nbr_ptr) {
             int nbr_id = this->_Gi[nbr_ptr];
-            if (g_node >= nbr_id)
-                continue;
-            if(this->_decomposition_tree.is_separator(nbr_id)) continue;
+            assert(nbr_id < _decomposition_tree.is_sep.size());
+            if(this->_decomposition_tree.is_sep[nbr_id] == 1) continue;
             int nbr_partition_id = get_partition_id(nbr_id);
             if(partition_id == nbr_partition_id) continue;
             separator_superset.push_back(g_node);
-            separator_superset.push_back(nbr_id);
+            break;
         }
     }
     //Erase repetitive nodes
-    std::sort(separator_superset.begin(), separator_superset.end());
+    // std::sort(separator_superset.begin(), separator_superset.end());
+    #ifndef NDEBUG
+    int prev_size = separator_superset.size();
     separator_superset.erase(std::unique(separator_superset.begin(), separator_superset.end()), separator_superset.end());
+    int after_size = separator_superset.size();
+    assert(prev_size == after_size);
+    #endif
 }
 
 void GPUOrdering_V2::refine_bipartate_separator(
@@ -284,7 +297,7 @@ void GPUOrdering_V2::refine_bipartate_separator(
     std::vector<int>& separator_superset)
 {
     // The boundary nodes to be used for extracting bipartite graph
-    if (separator_superset.size() == 0) {
+    if (separator_superset.empty()) {
         return;
     }
     // Extract the bipartite graph from the separator nodes
@@ -306,8 +319,6 @@ void GPUOrdering_V2::refine_bipartate_separator(
 #endif
 
     //Step 1: Extract the bipartite graph from the separator nodes
-    Eigen::SparseMatrix<int>         bipartite_graph;
-    std::vector<Eigen::Triplet<int>> triplets;
     // mapping from separator nodes to local nodes
     std::map<int, int> separator_node_to_local_node;
     for (int i = 0; i < separator_superset.size(); i++) {
@@ -321,26 +332,31 @@ void GPUOrdering_V2::refine_bipartate_separator(
     };
 
     // Extract the bipartite graph
+    std::vector<int> bipart_p(separator_superset.size() + 1, 0);
+    std::vector<int> bipart_i;
+    int bipartition_nnz = 0;
     for (auto& g_node : separator_superset) {
         assert(!this->_decomposition_tree.is_separator(g_node));
         int g_node_tree_id = get_tree_id(g_node);
+        int bipart_node_id = separator_node_to_local_node[g_node];
         for (int nbr_ptr = this->_Gp[g_node]; nbr_ptr < this->_Gp[g_node + 1]; nbr_ptr++) {
             int nbr_id = this->_Gi[nbr_ptr];
             //Not in the separator set
             if(separator_node_to_local_node.find(nbr_id) == separator_node_to_local_node.end()) continue;
             //They should not be in the same partition
             int nbr_node_tree_id = get_tree_id(nbr_id);
-            if (g_node_tree_id == nbr_node_tree_id) continue;;
-            triplets.push_back(Eigen::Triplet<int>(separator_node_to_local_node[g_node], separator_node_to_local_node[nbr_id], 1));
-            triplets.push_back(Eigen::Triplet<int>(separator_node_to_local_node[nbr_id], separator_node_to_local_node[g_node], 1));
+            if (g_node_tree_id == nbr_node_tree_id) continue;
+            int bipart_nbr_id = separator_node_to_local_node[nbr_id];
+            // triplets.emplace_back(separator_node_to_local_node[g_node], separator_node_to_local_node[nbr_id], 1);
+            // triplets.emplace_back(separator_node_to_local_node[nbr_id], separator_node_to_local_node[g_node], 1);
+            bipart_i.push_back(bipart_nbr_id);
+            bipartition_nnz++;
         }
+        bipart_p[bipart_node_id + 1] = bipartition_nnz;
     }
-    bipartite_graph.resize(separator_superset.size(), separator_superset.size());
-    bipartite_graph.setFromTriplets(triplets.begin(), triplets.end());
-    bipartite_graph.makeCompressed();
 
-    //=========== Step 3: Use the min_vertex_cover_bipartite to compute the max
-    //matching and thus min vertex cover ============
+
+    //=========== Step : assign bipartition for max match
     std::vector<int> local_graph_to_partition(separator_superset.size(), -1);
     for(int i = 0; i < separator_superset.size(); i++) {
         int tree_node_id = get_tree_id(separator_superset[i]);
@@ -353,11 +369,32 @@ void GPUOrdering_V2::refine_bipartate_separator(
     }
 
 #ifdef DEBUG
-    for (int node = 0; node < bipartite_graph.rows(); node++) {
-        for (int nbr_ptr = bipartite_graph.outerIndexPtr()[node];
-             nbr_ptr < bipartite_graph.outerIndexPtr()[node + 1];
+    //Check for symmetric
+    for (int i = 0; i < separator_superset.size(); i++) {
+        for (int j_ptr = bipart_p[i]; j_ptr < bipart_p[i + 1]; ++j_ptr) {
+            int j = bipart_i[j_ptr];
+            // Check if edge (j, i) exists
+            bool found_reverse_edge = false;
+            for (int i_ptr = bipart_p[j]; i_ptr < bipart_p[j + 1]; ++i_ptr) {
+                if (bipart_i[i_ptr] == i) {
+                    found_reverse_edge = true;
+                    break;
+                }
+            }
+            if (!found_reverse_edge) {
+                spdlog::error("The matrix is not symmetric: edge ({}, {}) exists but ({}, {}) does not", i, j, j, i);
+                assert(false);
+            }
+        }
+    }
+
+
+    //Check for bipartite
+    for (int node = 0; node < separator_superset.size(); node++) {
+        for (int nbr_ptr = bipart_p[node];
+             nbr_ptr < bipart_p[node + 1];
              ++nbr_ptr) {
-            int nbr_id = bipartite_graph.innerIndexPtr()[nbr_ptr];
+            int nbr_id = bipart_i[nbr_ptr];
             int partition_id = local_graph_to_partition[node];
             int nbr_partition_id = local_graph_to_partition[nbr_id];
             if (partition_id == nbr_partition_id) {
@@ -370,9 +407,9 @@ void GPUOrdering_V2::refine_bipartate_separator(
 
 
     RXMESH_SOLVER::MinVertexCoverBipartite solver(
-        bipartite_graph.rows(),
-        bipartite_graph.outerIndexPtr(),
-        bipartite_graph.innerIndexPtr(),
+        separator_superset.size(),
+        bipart_p.data(),
+        bipart_i.data(),
         local_graph_to_partition);
     std::vector<int> min_vertex_cover = solver.compute_min_vertex_cover();
     //=========== Step 4: Update the separator nodes ============
@@ -397,13 +434,12 @@ void GPUOrdering_V2::refine_bipartate_separator(
 #endif
 }
 
-
 void GPUOrdering_V2::three_way_G_partition(
     int tree_node_idx,
     std::vector<int>& assigned_g_nodes,
     std::vector<int>& separator_g_nodes)
 {
-    find_separator_superset(assigned_g_nodes, separator_g_nodes);
+    find_separator_superset_CPU(assigned_g_nodes, separator_g_nodes);
     refine_bipartate_separator(tree_node_idx, separator_g_nodes);
 }
 
@@ -437,7 +473,6 @@ void GPUOrdering_V2::decompose()
     // Think of this as the input of decompose function in recursive manner
     struct DecompositionInfo
     {
-        int              decomposition_node_id        = -1;
         int              decomposition_node_parent_id = -1;
         std::vector<int> assigned_g_nodes;
     };
@@ -445,16 +480,12 @@ void GPUOrdering_V2::decompose()
     // Initialize the first call for the decomposition info stack
     std::vector<DecompositionInfo> decomposition_info_stack(
         this->_decomposition_tree.get_number_of_decomposition_nodes());
-    decomposition_info_stack[0].decomposition_node_id        = 0;
     decomposition_info_stack[0].decomposition_node_parent_id = -1;
     decomposition_info_stack[0].assigned_g_nodes.resize(_G_n);
     for(int i = 0; i < _G_n; i++) {
         decomposition_info_stack[0].assigned_g_nodes[i] = i;
     }
 
-    //Show where patches are in the tree during decomposition
-    _decomposition_tree.q_node_to_tree_node.resize(this->_num_patches, 0);
-    _decomposition_tree.g_node_to_tree_node.resize(this->_G_n, 0);
     #pragma omp parallel
     {
         for (int l = 0; l < this->_decomposition_tree.decomposition_level; l++) {
@@ -462,27 +493,26 @@ void GPUOrdering_V2::decompose()
             int end_level_idx   = (1 << (l + 1)) - 1;
             assert(end_level_idx < this->_decomposition_tree.get_number_of_decomposition_nodes());
             #pragma omp for schedule(dynamic)
-            for (int node_idx = start_level_idx; node_idx < end_level_idx;
-                 ++node_idx) {
+            for (int tree_node_idx = start_level_idx; tree_node_idx < end_level_idx;
+                 ++tree_node_idx) {
                 // Get the input information for the current node
 #ifndef NDEBUG
-                spdlog::info("*********** Working on node {} ***********", node_idx);
+                spdlog::info("*********** Working on node {} ***********", tree_node_idx);
 #endif
-                int decomposition_node_id = decomposition_info_stack[node_idx].decomposition_node_id;
-                int decomposition_node_parent_id = decomposition_info_stack[node_idx].decomposition_node_parent_id;
-                std::vector<int>& assigned_g_nodes = decomposition_info_stack[node_idx].assigned_g_nodes;
-                auto& cur_decomposition_node =this->_decomposition_tree.decomposition_nodes[decomposition_node_id];
+                int decomposition_node_parent_id = decomposition_info_stack[tree_node_idx].decomposition_node_parent_id;
+                std::vector<int>& assigned_g_nodes = decomposition_info_stack[tree_node_idx].assigned_g_nodes;
+                auto& cur_decomposition_node =this->_decomposition_tree.decomposition_nodes[tree_node_idx];
 
                 //++++++ if it is not decomposable, skip it ******
                 if(assigned_g_nodes.size() == 0) continue;
 
-                if (decomposition_node_id == -1 ||
+                if (tree_node_idx == -1 ||
                     decomposition_node_parent_id == -1) {
-                    if (decomposition_node_id != 0) {
+                    if (tree_node_idx != 0) {
                         spdlog::error("The info is not initialized correctly.");
                         spdlog::error("The level is {}", l);
                         spdlog::error("The node_id {}, and parent_id {}",
-                                      decomposition_node_id,
+                                      tree_node_idx,
                                       decomposition_node_parent_id);
                     }
                 }
@@ -494,13 +524,13 @@ void GPUOrdering_V2::decompose()
                     cur_decomposition_node.init_node(
                         -1,
                         -1,
-                        decomposition_node_id,
+                        tree_node_idx,
                         decomposition_node_parent_id,
                         l,
                         assigned_g_nodes);
                     //Assign nodes to tree array
                     for (const auto& node: assigned_g_nodes) {
-                        this->_decomposition_tree.g_node_to_tree_node[node] = node_idx;
+                        this->_decomposition_tree.g_node_to_tree_node[node] = tree_node_idx;
                     }
                     continue;
                 }
@@ -514,21 +544,22 @@ void GPUOrdering_V2::decompose()
                 // Step 1: Compute two equal size partitions from the assigned dofs
 
                 std::vector<int> two_way_dof_partition_map;
-                this->two_way_Q_partition(node_idx, assigned_g_nodes);
+                this->two_way_Q_partition(tree_node_idx, assigned_g_nodes);
                 // Step 2: Find the separator nodes of the two partitions
                 std::vector<int> left_assigned_g_nodes, right_assigned_g_nodes;
                 std::vector<int> separator_g_nodes;
-                this->three_way_G_partition(node_idx, assigned_g_nodes, separator_g_nodes);
+                this->three_way_G_partition(tree_node_idx, assigned_g_nodes, separator_g_nodes);
 
                 left_assigned_g_nodes.clear();
                 right_assigned_g_nodes.clear();
                 //flag the separator nodes in the decomposition tree
-                for(int separator_g_node : separator_g_nodes) {
-                    assert(this->_decomposition_tree.is_separator(separator_g_node) == false);
-                    this->_decomposition_tree.set_separator(separator_g_node);
-                    this->_decomposition_tree.g_node_to_tree_node[separator_g_node] = node_idx;
-                }
+                // for(int separator_g_node : separator_g_nodes) {
+                //     assert(this->_decomposition_tree.is_separator(separator_g_node) == false);
+                //     this->_decomposition_tree.set_separator(separator_g_node);
+                //     this->_decomposition_tree.g_node_to_tree_node[separator_g_node] = tree_node_idx;
+                // }
 
+                this->_decomposition_tree.assign_nodes_to_tree(separator_g_nodes, tree_node_idx);
                 //Assign the nodes to the left and right assigned dofs
                 left_assigned_g_nodes.reserve(assigned_g_nodes.size());
                 right_assigned_g_nodes.reserve(assigned_g_nodes.size());
@@ -537,11 +568,11 @@ void GPUOrdering_V2::decompose()
                     int q_node = this->_g_node_to_patch[g_node];
                     if(this->_decomposition_tree.is_separator(g_node)) continue;
                     int q_partition = this->_decomposition_tree.q_node_to_tree_node[q_node];
-                    if(q_partition == node_idx * 2 + 1) {
+                    if(q_partition == tree_node_idx * 2 + 1) {
                         left_assigned_g_nodes.push_back(g_node);
                     } else {
                         right_assigned_g_nodes.push_back(g_node);
-                        assert(q_partition == node_idx * 2 + 2);
+                        assert(q_partition == tree_node_idx * 2 + 2);
                     }
                 }
                 //Compress
@@ -557,8 +588,8 @@ void GPUOrdering_V2::decompose()
 
                 // Initialize the input of the left and right children for the
                 // next wavefront
-                int left_node_idx  = decomposition_node_id * 2 + 1;
-                int right_node_idx = decomposition_node_id * 2 + 2;
+                int left_node_idx  = tree_node_idx * 2 + 1;
+                int right_node_idx = tree_node_idx * 2 + 2;
                 if (left_assigned_g_nodes.empty()) {
                     left_node_idx = -1;
                 }
@@ -577,7 +608,7 @@ void GPUOrdering_V2::decompose()
 
                 cur_decomposition_node.init_node(left_node_idx,
                                                  right_node_idx,
-                                                 decomposition_node_id,
+                                                 tree_node_idx,
                                                  decomposition_node_parent_id,
                                                  l,
                                                  separator_g_nodes);
@@ -588,9 +619,7 @@ void GPUOrdering_V2::decompose()
                     assert(!left_assigned_g_nodes.empty() &&
                            "Left child should have assigned patches");
                     decomposition_info_stack[left_node_idx]
-                        .decomposition_node_id = left_node_idx;
-                    decomposition_info_stack[left_node_idx]
-                        .decomposition_node_parent_id = decomposition_node_id;
+                        .decomposition_node_parent_id = tree_node_idx;
                     decomposition_info_stack[left_node_idx].assigned_g_nodes =
                         left_assigned_g_nodes;
                 }
@@ -602,9 +631,7 @@ void GPUOrdering_V2::decompose()
                     assert(!right_assigned_g_nodes.empty() &&
                            "Right child should have assigned patches");
                     decomposition_info_stack[right_node_idx]
-                        .decomposition_node_id = right_node_idx;
-                    decomposition_info_stack[right_node_idx]
-                        .decomposition_node_parent_id = decomposition_node_id;
+                        .decomposition_node_parent_id = tree_node_idx;
                     decomposition_info_stack[right_node_idx].assigned_g_nodes =
                         right_assigned_g_nodes;
                 }
@@ -619,24 +646,38 @@ void GPUOrdering_V2::init_patches()
     // Create RXMeshStatic from the mesh data (face-vertex connectivity)
     // Use default patch size of 512 (can be adjusted)
     rxmesh::rx_init(0);
-    rxmesh::RXMeshStatic rx(this->fv, "", this->_patch_size);
+    this->_rxmesh = std::make_unique<rxmesh::RXMeshStatic>(this->fv, "", this->_patch_size);
 
     spdlog::info(
         "RXMesh initialized with {} vertices, {} edges, {} faces, {} patches",
-        rx.get_num_vertices(),
-        rx.get_num_edges(),
-        rx.get_num_faces(),
-        rx.get_num_patches());
+        this->_rxmesh->get_num_vertices(),
+        this->_rxmesh->get_num_edges(),
+        this->_rxmesh->get_num_faces(),
+        this->_rxmesh->get_num_patches());
 
-    this->_g_node_to_patch.resize(rx.get_num_vertices());
-    rx.for_each_vertex(
+    this->_g_node_to_patch.resize(this->_rxmesh->get_num_vertices());
+    this->_rxmesh->for_each_vertex(
         rxmesh::HOST,
         [&](const rxmesh::VertexHandle vh) {
-            uint32_t node_id       = rx.map_to_global(vh);
+            uint32_t node_id       = _rxmesh->map_to_global(vh);
             this->_g_node_to_patch[node_id] = static_cast<int>(vh.patch_id());
         },
         NULL,
         false);
+
+    this->_num_patches = _rxmesh->get_num_patches();
+    int num_levels = std::ceil(std::log2(this->_num_patches));
+    int total_number_of_decomposition_nodes = (1 << (num_levels + 1)) - 1;
+    spdlog::info("Decomposition tree creation .. ");
+    spdlog::info("Number of decomposition levels: {}", num_levels);
+    spdlog::info("Using local permutation {}", this->local_permute_method);
+
+    this->_decomposition_tree.init_decomposition_tree(
+        total_number_of_decomposition_nodes,
+        num_levels, _rxmesh->get_num_vertices(), this->_num_patches, _use_gpu);
+    if(_use_gpu) {
+        _d_g_node_to_patch = _g_node_to_patch;
+    }
 }
 
 
@@ -690,73 +731,121 @@ void GPUOrdering_V2::step1_compute_quotient_graph()
     // Given node to patch, first give each separator node a unique patch ID
     // Step 1: assign patch-id -1 to each boundary vertex
     // Count the number of patch ids
-    std::unordered_set<int> unique_ids;
-    std::map<int, int>      node_per_patch_count;
-    for (int i = 0; i < this->_g_node_to_patch.size(); ++i) {
-        unique_ids.insert(this->_g_node_to_patch[i]);
-        node_per_patch_count[this->_g_node_to_patch[i]]++;
-    }
-    // Count the offset of each patch to create continuous patch ids
-    std::vector<int> patch_offset(unique_ids.size(), 0);
-    for (int i = 0; i < unique_ids.size(); ++i) {
-        // It is an empty patch and all the patch after it should be offset by 1
-        if (node_per_patch_count[i] == 0) {
-            for (int j = i; j < unique_ids.size(); ++j) {
-                patch_offset[j]++;
-            }
-        }
-    }
-    std::unordered_set<int> unique_ids_reduced;
-    for (int i = 0; i < this->_g_node_to_patch.size(); ++i) {
-        this->_g_node_to_patch[i] -= patch_offset[this->_g_node_to_patch[i]];
-        unique_ids_reduced.insert(this->_g_node_to_patch[i]);
-    }
-    spdlog::info(
-        "Number of initial patches before and after reduction: {} -> {}",
-        unique_ids.size(),
-        unique_ids_reduced.size());
-    this->_num_patches = unique_ids_reduced.size();
-    assert(this->_g_node_to_patch.size() == this->_G_n);
 
+    // auto patch_fix_start = std::chrono::high_resolution_clock::now();
+    std::vector<int> patch_offset(_num_patches, 1);
+    // auto patch_fix_end = std::chrono::high_resolution_clock::now();
+    // auto patch_time = std::chrono::duration_cast<std::chrono::milliseconds>(patch_fix_end - patch_fix_start).count();
+    // spdlog::info("Patch fix time: {} ms for vector of size {}", patch_time, _num_patches);
+    for (int i = 0; i < _g_node_to_patch.size(); i++) {
+        int patch_id = _g_node_to_patch[i];
+        patch_offset[patch_id] = 0;
+    }
+
+
+    //prefix scan
+    for (int i = 1; i < _num_patches; ++i) {
+        patch_offset[i] += patch_offset[i - 1];
+    }
+
+    for (int i = 0; i < _g_node_to_patch.size(); i++) {
+        int patch_id = _g_node_to_patch[i];
+        _g_node_to_patch[i] -= patch_offset[patch_id];
+    }
+    this->_num_patches -= patch_offset.back();
+
+    assert(this->_g_node_to_patch.size() == this->_G_n);
 
     
     //Create the local quotient graph
-    Eigen::SparseMatrix<int> Q;
-    Q.resize(this->_num_patches, this->_num_patches);
-    this->_quotient_graph._Q_node_weights.resize(this->_num_patches, 0);
-    std::vector<Eigen::Triplet<int>> triplets;
-    for(int g_node = 0; g_node < this->_G_n; g_node++) {
-        int node_q_id = this->_g_node_to_patch[g_node];
-        assert(node_q_id != -1);
-        this->_quotient_graph._Q_node_weights[node_q_id]++;
-        for(int nbr_ptr = this->_Gp[g_node]; nbr_ptr < this->_Gp[g_node + 1]; nbr_ptr++) {
-            int nbr_id = this->_Gi[nbr_ptr];
-            int q_nbr_id = this->_g_node_to_patch[nbr_id];
-            if (q_nbr_id == node_q_id) continue;
-            triplets.push_back(Eigen::Triplet<int>(node_q_id, q_nbr_id, 1));
+    // auto quotient_start = std::chrono::high_resolution_clock::now();
+    
+    // 1. Node weights (patch sizes) and mapping nodes -> patches
+    _quotient_graph._Q_node_weights.assign(_num_patches, 0);
+
+    // Optional but very useful: nodes of each patch
+    std::vector<std::vector<int>> patch_nodes(_num_patches);
+    patch_nodes.reserve(_num_patches);
+
+    for (int g = 0; g < _G_n; ++g) {
+        int p = this->_g_node_to_patch[g];
+        assert(p >= 0 && p < _num_patches);
+        _quotient_graph._Q_node_weights[p]++;
+        patch_nodes[p].push_back(g);
+    }
+
+    // 2. Build adjacency lists of quotient graph (per patch)
+    std::vector<std::vector<int>> Q_adj(_num_patches);
+    std::vector<int> mark(_num_patches, -1);  // mark[q] == p means q already added as neighbor of p
+
+    for (int p = 0; p < _num_patches; ++p) {
+        auto &nodes = patch_nodes[p];
+        if (nodes.empty()) continue;
+
+        for (int g : nodes) {
+            for (int nbr_ptr = this->_Gp[g]; nbr_ptr < this->_Gp[g + 1]; ++nbr_ptr) {
+                int nbr_id = this->_Gi[nbr_ptr];
+                int q = this->_g_node_to_patch[nbr_id];
+                if (q == p) continue;  // stay inside patch -> no quotient edge
+
+                // Deduplicate neighbors for this p using "mark"
+                if (mark[q] == p) continue;
+                mark[q] = p;
+                Q_adj[p].push_back(q);
+            }
         }
     }
-    Q.setFromTriplets(triplets.begin(), triplets.end());//The edge weights are the values of the edges
-    Q.makeCompressed();
+
+    int q_nnz = 0;
+    for (auto& nbrs: Q_adj) {
+        std::sort(nbrs.begin(), nbrs.end());
+        q_nnz += nbrs.size();
+    }
     _quotient_graph._Q_n = this->_num_patches;
     _quotient_graph._Qp.resize(this->_num_patches + 1, 0);
-    _quotient_graph._Qi.resize(Q.nonZeros(), 0);
-    _quotient_graph._Q_edge_weights.resize(Q.nonZeros(), 0);
-    std::copy(Q.outerIndexPtr(), Q.outerIndexPtr() + this->_num_patches + 1, _quotient_graph._Qp.begin());
-    std::copy(Q.innerIndexPtr(), Q.innerIndexPtr() + Q.nonZeros(), _quotient_graph._Qi.begin());
-    std::copy(Q.valuePtr(), Q.valuePtr() + Q.nonZeros(), _quotient_graph._Q_edge_weights.begin());
+    _quotient_graph._Qi.resize(q_nnz, 0);
+    int cnt = 0;
+    for(int q_id = 0; q_id < this->_num_patches; q_id++) {
+        auto& nbrs = Q_adj[q_id];
+        for (const auto&  nbr: nbrs) {
+            _quotient_graph._Qi[cnt] = nbr;
+            cnt++;
+        }
+        _quotient_graph._Qp[q_id + 1] = cnt;
+    }
+    assert(cnt == q_nnz);
+    #ifdef DEBUG
+    // Check if the quotient graph CSR matrix is symmetric
+    bool is_symmetric = true;
+    for (int i = 0; i < _quotient_graph._Q_n; ++i) {
+        for (int idx = _quotient_graph._Qp[i]; idx < _quotient_graph._Qp[i + 1]; ++idx) {
+            int j = _quotient_graph._Qi[idx];
+            
+            // Check if i exists in row j's neighbors
+            bool found = false;
+            for (int jdx = _quotient_graph._Qp[j]; jdx < _quotient_graph._Qp[j + 1]; ++jdx) {
+                if (_quotient_graph._Qi[jdx] == i) {
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (!found) {
+                is_symmetric = false;
+                spdlog::warn("CSR matrix is NOT symmetric: edge ({}, {}) exists but ({}, {}) does not", i, j, j, i);
+                break;
+            }
+        }
+        if (!is_symmetric) break;
+    }
+    assert(is_symmetric);
+    #endif
 }
 
 void GPUOrdering_V2::step2_create_decomposition_tree()
 {
     // Step 2.1: create the hierarchical partitioning
-    int num_levels = std::ceil(std::log2(this->_num_patches));
-    int total_number_of_decomposition_nodes = (1 << (num_levels + 1)) - 1;
-    this->_decomposition_tree.init_decomposition_tree(
-        total_number_of_decomposition_nodes, num_levels, this->_G_n);
-    spdlog::info("Decomposition tree creation .. ");
-    spdlog::info("Number of decomposition levels: {}", num_levels);
-    spdlog::info("Using local permutation {}", this->local_permute_method);
+
 
     this->decompose();
     spdlog::info("Decomposition tree is created.");
