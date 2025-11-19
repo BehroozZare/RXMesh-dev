@@ -30,6 +30,13 @@ void GPUOrdering_V2::setGraph(int* Gp, int* Gi, int G_N, int NNZ)
     this->_Gi    = Gi;
     this->_G_n   = G_N;
     this->_G_nnz = NNZ;
+    if (_use_gpu) {
+        this->_d_Gp.resize(_G_n + 1);
+        thrust::copy(Gp, Gp + _G_n + 1, _d_Gp.begin());
+        this->_d_Gi.resize(NNZ);
+        thrust::copy(Gi, Gi + NNZ, _d_Gi.begin());
+    }
+
 }
 
 
@@ -250,11 +257,72 @@ void GPUOrdering_V2::two_way_Q_partition(
 }
 
 
+// Functor must be defined outside the function for CUDA compatibility
+struct is_node_separator_functor {
+    int _n;
+    int* _p;
+    int* _i;
+    char *_is_sep;
+    int* _g_node_to_patch;
+    int* _q_node_to_tree_node;
+
+    __host__ __device__
+    is_node_separator_functor(int* p, int* i, int n, char* is_sep, int* g_node_to_patch, int* q_node_to_tree_node) {
+        this->_p = p;
+        this->_i = i;
+        this->_n = n;
+        this->_is_sep = is_sep;
+        this->_g_node_to_patch = g_node_to_patch;
+        this->_q_node_to_tree_node = q_node_to_tree_node;
+    }
+
+    __host__ __device__
+    int get_tree_node_id(int node) {
+        int q_node_id = this->_g_node_to_patch[node];
+        return this->_q_node_to_tree_node[q_node_id];
+    }
+
+    __host__ __device__
+    int operator()(int node) {
+        int tree_node_id = get_tree_node_id(node);
+        for (int nbr_ptr = this->_p[node]; nbr_ptr < this->_p[node + 1]; ++nbr_ptr) {
+            const int nbr_id = this->_i[nbr_ptr];
+            if(this->_is_sep[nbr_id] == 1) continue;
+            int nbr_partition_id = get_tree_node_id(nbr_id);
+            if(tree_node_id == nbr_partition_id) continue;
+            return node;
+        }
+        return -1;
+    }
+};
+
 void GPUOrdering_V2::find_separator_superset_GPU(
     std::vector<int>& assigned_g_nodes,///<[in] Assigned G nodes for current decomposition
     std::vector<int>& separator_superset///<[out] The superset of separator nodes
-){
+)
+{
+    thrust::device_vector<int> d_assigned_g_nodes(assigned_g_nodes.size());
+    thrust::copy(assigned_g_nodes.begin(), assigned_g_nodes.end(), d_assigned_g_nodes.begin());
 
+    auto sep_operator_obj = is_node_separator_functor(
+        thrust::raw_pointer_cast(this->_d_Gp.data()),
+        thrust::raw_pointer_cast(this->_d_Gi.data()),
+        this->_G_n,
+        thrust::raw_pointer_cast(this->_decomposition_tree.d_is_sep.data()),
+        thrust::raw_pointer_cast(this->_d_g_node_to_patch.data()),
+        thrust::raw_pointer_cast(this->_decomposition_tree.d_q_node_to_tree_node.data()));
+
+    auto start = thrust::make_transform_iterator(d_assigned_g_nodes.begin(), sep_operator_obj);
+    auto end = thrust::make_transform_iterator(d_assigned_g_nodes.end(), sep_operator_obj);
+    thrust::device_vector<int> d_separator_superset(assigned_g_nodes.size(), -1);
+    auto end_it = thrust::copy_if(
+        start,
+        end,
+        d_separator_superset.begin(),
+        [] __device__ (int flag) { return flag != -1; });
+
+    separator_superset.resize(end_it - d_separator_superset.begin());
+    thrust::copy(d_separator_superset.begin(), end_it, separator_superset.begin());
 }
 
 void GPUOrdering_V2::find_separator_superset_CPU(
@@ -439,7 +507,13 @@ void GPUOrdering_V2::three_way_G_partition(
     std::vector<int>& assigned_g_nodes,
     std::vector<int>& separator_g_nodes)
 {
-    find_separator_superset_CPU(assigned_g_nodes, separator_g_nodes);
+    if (_use_gpu) {
+        find_separator_superset_GPU(assigned_g_nodes, separator_g_nodes);
+    } else {
+        find_separator_superset_CPU(assigned_g_nodes, separator_g_nodes);
+    }
+    
+
     refine_bipartate_separator(tree_node_idx, separator_g_nodes);
 }
 
@@ -545,10 +619,21 @@ void GPUOrdering_V2::decompose()
 
                 std::vector<int> two_way_dof_partition_map;
                 this->two_way_Q_partition(tree_node_idx, assigned_g_nodes);
+
+                //Copy the q to tree_node
+                if(_use_gpu) {
+                    THRUST_CALL(thrust::copy(this->_decomposition_tree.q_node_to_tree_node.begin(),
+                        this->_decomposition_tree.q_node_to_tree_node.end(),
+                        this->_decomposition_tree.d_q_node_to_tree_node.begin()));
+                }
+
+
                 // Step 2: Find the separator nodes of the two partitions
                 std::vector<int> left_assigned_g_nodes, right_assigned_g_nodes;
                 std::vector<int> separator_g_nodes;
                 this->three_way_G_partition(tree_node_idx, assigned_g_nodes, separator_g_nodes);
+
+                
 
                 left_assigned_g_nodes.clear();
                 right_assigned_g_nodes.clear();

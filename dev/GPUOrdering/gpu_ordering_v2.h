@@ -70,7 +70,7 @@ public:
         std::vector<int> q_node_to_tree_node;
         thrust::device_vector<int> d_q_node_to_tree_node;
         thrust::device_vector<char> d_is_sep;
-        bool _use_gpu = false;
+        bool _use_gpu = true;
 
 
         void init_decomposition_tree(int num_decomposition_nodes,

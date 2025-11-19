@@ -26,6 +26,8 @@ struct CLIArgs
     std::string output_address;
     std::string solver_type   = "CHOLMOD";
     std::string ordering_type = "DEFAULT";
+    int use_gpu = 1;
+
     CLIArgs(int argc, char* argv[])
     {
         CLI::App app{"Separator analysis"};
@@ -33,6 +35,7 @@ struct CLIArgs
         app.add_option("-s,--solver", solver_type, "solver type");
         app.add_option("-o,--output", output_address, "output folder name");
         app.add_option("-i,--input", input_mesh, "input mesh name");
+        app.add_option("-g,--use_gpu", use_gpu, "input mesh name");
 
         try {
             app.parse(argc, argv);
@@ -116,6 +119,8 @@ int main(int argc, char* argv[])
         spdlog::info("Using POC_ND ordering.");
         ordering = RXMESH_SOLVER::Ordering::create(
             RXMESH_SOLVER::RXMESH_Ordering_Type::POC_ND);
+        //Fun fact .. this single line mess with gpu performance :))
+        // ordering->setOptions({{"use_gpu", std::to_string(args.use_gpu)}});
     } else if (args.ordering_type == "PARTH") {
         ordering = RXMESH_SOLVER::Ordering::create(
             RXMESH_SOLVER::RXMESH_Ordering_Type::PARTH);
